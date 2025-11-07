@@ -108,8 +108,9 @@ https://github.com/user-attachments/assets/f4d123f3-4b2d-4c8d-94b2-034a1acaa00d
 5. **Creating Connected Nodes**: 
    - Right-click on a node and select "Create Connected Node" to add a new node connected to the selected one.
 
-6. **Deleting Connections**: 
+6. **Deleting Connections / nodes**: 
    - Click on a connection to delete it.
+   - Select nodes by dragging the mouse and press delete/backspace key
 
 7. **Regenerating Responses**: 
    - Edit a user input node and all subsequent LLM response nodes will automatically regenerate.
