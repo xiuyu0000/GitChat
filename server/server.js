@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const OpenAI = require('openai');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const fs = require('fs').promises;
 require('dotenv').config();
 
@@ -14,8 +15,22 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Configure OpenAI API
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Detect system proxy
+const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
+
+// Configure OpenAI API (via OpenRouter)
+const openaiConfig = {
+  baseURL: 'https://openrouter.ai/api/v1',
+  apiKey: process.env.OPENROUTER_API_KEY,
+};
+
+if (proxyUrl) {
+  openaiConfig.httpAgent = new HttpsProxyAgent(proxyUrl);
+  openaiConfig.httpsAgent = new HttpsProxyAgent(proxyUrl);
+  console.log(`Using proxy: ${proxyUrl}`);
+}
+
+const openai = new OpenAI(openaiConfig);
 
 let systemPrompt;
 
@@ -39,7 +54,7 @@ app.post("/generate", async (req, res) => {
     });
 
     const stream = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: "anthropic/claude-opus-4-6",
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: JSON.stringify(data) }
@@ -57,7 +72,12 @@ app.post("/generate", async (req, res) => {
     res.end();
   } catch (error) {
     console.error("Error in generate endpoint:", error);
-    res.status(500).json({ error: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+      res.end();
+    }
   }
 });
 
