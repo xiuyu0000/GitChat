@@ -1,297 +1,499 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
-  ReactFlow,
-  MiniMap,
-  Controls,
   Background,
-  useNodesState,
-  useEdgesState,
-  useReactFlow,
-  useStoreApi,
+  Controls,
+  MiniMap,
+  ReactFlow,
   SelectionMode,
+  useReactFlow,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { Menu, Item, useContextMenu } from 'react-contexify';
-import 'react-contexify/dist/ReactContexify.css';
 import UserInputNode from './UserInputNode';
 import LLMResponseNode from './LLMResponseNode';
+import SummaryNode from './SummaryNode';
 import CustomEdge from './CustomEdge';
-import { sendConversationRequest, getConversationHistory } from './Utility';
+import { useResearchStore } from '../store/researchStore';
+import { exportDatabase, saveSessionSnapshot } from '../lib/db';
+import {
+  buildMarkdownForNode,
+  buildMessages,
+  createProjectExportPayload,
+  getParentNodeId,
+  shouldWarnForTokens,
+} from '../lib/graph';
+import { streamCompletion } from '../services/LLMNetworkClient';
 
 const nodeTypes = {
   userInput: UserInputNode,
   llmResponse: LLMResponseNode,
+  summaryNote: SummaryNode,
 };
 
 const edgeTypes = {
   custom: CustomEdge,
 };
 
-const MENU_ID = 'node-context-menu';
-let currentOverlapOffset = 0;
-const OVERLAP_OFFSET = 10;
+function downloadText(filename, content, contentType = 'text/plain;charset=utf-8') {
+  const blob = new Blob([content], { type: contentType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
 
 function NodeChat() {
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
-  const reactFlowWrapper = useRef(null);
-  const [message, setMessage] = useState('');
-  const store = useStoreApi();
   const reactFlow = useReactFlow();
-  const { show } = useContextMenu({
-    id: MENU_ID,
-  });
-  const currentLlmNodeId = useRef(null);
+  const fileInputRef = useRef(null);
+  const persistenceTimerRef = useRef(null);
+  const abortRef = useRef(null);
 
-  const onEdgeClick = useCallback((edgeId) => {
-    setEdges((eds) => eds.filter((e) => e.id !== edgeId));
-  }, [setEdges]);
+  const {
+    sessions,
+    activeSessionId,
+    nodes,
+    edges,
+    composerMessage,
+    isHydrated,
+    ui,
+    generation,
+    initializeWorkspace,
+    switchSession,
+    createSession,
+    renameSession,
+    deleteSession,
+    importProject,
+    setViewport,
+    setComposerMessage,
+    setGlobalWarning,
+    clearGlobalWarning,
+    onNodesChange,
+    onEdgesChange,
+    connectNodes,
+    deleteEdge,
+    selectNode,
+    deleteSelectedNodes,
+    updateNodeText,
+    updateNodeConfig,
+    updateNodeMeasurements,
+    setNodeStatus,
+    setNodeTokenInfo,
+    clearNodeOutput,
+    appendNodeChunk,
+    setNodeStale,
+    markNodesStale,
+    createSummaryNode,
+    createComposerFlow,
+    buildRegenerationTargets,
+    queueGeneration,
+    shiftGenerationQueue,
+    finishGeneration,
+  } = useResearchStore((state) => state);
 
-  const onConnect = useCallback(
-    (params) => setEdges((eds) => eds.concat({ 
-      ...params, 
-      id: `e${params.source}-${params.target}-${Date.now()}`,
-      data: { onEdgeClick },
-      type: 'custom' 
-    })),
-    [onEdgeClick, setEdges]
-  );
+  useEffect(() => {
+    initializeWorkspace();
+  }, [initializeWorkspace]);
 
-  const addNode = useCallback((type, sourceNode = null, offset = { x: 0, y: 0 }, text = null, connectToSource = false) => {
-    return new Promise((resolve) => {
-      const {
-        height,
-        width,
-        transform: [transformX, transformY, zoomLevel]
-      } = store.getState();
-      const zoomMultiplier = 1 / zoomLevel;
-      const centerX = -transformX * zoomMultiplier + (width * zoomMultiplier) / 2;
-      const centerY =
-        -transformY * zoomMultiplier + (height * zoomMultiplier) / 2;
+  useEffect(() => {
+    if (!isHydrated) {
+      return undefined;
+    }
 
-      let position;
-      if (sourceNode) {
-        position = {
-          x: sourceNode.position.x + offset.x,
-          y: sourceNode.position.y + offset.y,
-        };
-      } else {
-        position = {
-          x: centerX + currentOverlapOffset,
-          y: centerY + currentOverlapOffset
-        };
-        currentOverlapOffset += OVERLAP_OFFSET;
+    const unsubscribe = useResearchStore.subscribe((state) => {
+      if (!state.isHydrated || !state.activeSessionId) {
+        return;
       }
 
-      position.x = Number(position.x) || 0;
-      position.y = Number(position.y) || 0;
-
-      const newNode = {
-        id: `${type}-${Date.now()}`,
-        type,
-        data: { text: text || (type === 'userInput' ? 'New user input' : 'New LLM response') },
-        position: position,
-      };
-
-      setNodes((nds) => {
-        const updatedNodes = nds.concat(newNode);
-        resolve(newNode);
-        return updatedNodes;
-      });
-
-      if (sourceNode && connectToSource) {
-        setEdges((eds) =>
-          eds.concat({
-            id: `e${sourceNode.id}-${newNode.id}`,
-            source: sourceNode.id,
-            target: newNode.id,
-            data: { onEdgeClick },
-            type: 'custom',
-          })
-        );
+      if (persistenceTimerRef.current) {
+        window.clearTimeout(persistenceTimerRef.current);
       }
+
+      persistenceTimerRef.current = window.setTimeout(async () => {
+        const snapshot = useResearchStore.getState().snapshotForPersistence();
+        if (!snapshot.session) {
+          return;
+        }
+
+        await saveSessionSnapshot(snapshot.session, snapshot.nodes, snapshot.edges);
+      }, 500);
     });
-  }, [setNodes, setEdges, onEdgeClick, store]);
 
-  const onNodeContextMenu = useCallback(
-    (event, node) => {
-      event.preventDefault();
-      const pane = reactFlowWrapper.current.getBoundingClientRect();
-      show({
-        event,
-        props: {
-          node,
-          position: reactFlow.screenToFlowPosition({
-            x: event.clientX - pane.left,
-            y: event.clientY - pane.top,
-          }),
+    return () => {
+      if (persistenceTimerRef.current) {
+        window.clearTimeout(persistenceTimerRef.current);
+      }
+      unsubscribe();
+    };
+  }, [isHydrated]);
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return;
+    }
+
+    reactFlow.fitView({ padding: 0.2, duration: 250 });
+  }, [activeSessionId, isHydrated, reactFlow]);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        deleteSelectedNodes();
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [deleteSelectedNodes]);
+
+  const runAssistantNode = useCallback(async (assistantNodeId) => {
+    const state = useResearchStore.getState();
+    const assistantNode = state.nodes.find((node) => node.id === assistantNodeId);
+    const userNodeId = getParentNodeId(assistantNodeId, state.nodes, state.edges);
+    const userNode = state.nodes.find((node) => node.id === userNodeId);
+
+    if (!assistantNode || !userNode) {
+      return { skipped: true };
+    }
+
+    const tokenInfo = shouldWarnForTokens(userNodeId, state.nodes, state.edges);
+    setNodeTokenInfo(userNodeId, tokenInfo.usedTokens, tokenInfo.shouldWarn);
+
+    if (tokenInfo.shouldWarn) {
+      setGlobalWarning(`Context usage is ${tokenInfo.usedTokens}/${tokenInfo.maxTokens}. Summarize and branch before continuing.`);
+      return { blocked: true };
+    }
+
+    setNodeStale(assistantNodeId, false);
+    clearNodeOutput(assistantNodeId);
+    setNodeStatus(assistantNodeId, 'generating');
+
+    const controller = new AbortController();
+    abortRef.current = {
+      controller,
+      activeNodeId: assistantNodeId,
+    };
+
+    const messages = buildMessages(userNodeId, state.nodes, state.edges);
+    const config = userNode.data.config;
+
+    try {
+      await streamCompletion({
+        messages,
+        config,
+        signal: controller.signal,
+        onTextChunk: (chunk) => {
+          appendNodeChunk(assistantNodeId, chunk);
+        },
+        onDone: () => {
+          const latestState = useResearchStore.getState();
+          const node = latestState.nodes.find((item) => item.id === assistantNodeId);
+          const usedTokens = tokenInfo.usedTokens + (node?.data?.text ? node.data.text.length : 0);
+          setNodeTokenInfo(assistantNodeId, usedTokens, false);
+          setNodeStatus(assistantNodeId, 'done');
+        },
+        onError: (error) => {
+          setNodeStatus(assistantNodeId, 'error', error.message);
         },
       });
-    },
-    [show, reactFlow]
+
+      return { done: true };
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        setNodeStatus(assistantNodeId, 'done');
+        return { aborted: true };
+      }
+
+      setNodeStatus(assistantNodeId, 'error', error.message);
+      return { failed: true };
+    } finally {
+      abortRef.current = null;
+    }
+  }, [appendNodeChunk, clearNodeOutput, setGlobalWarning, setNodeStale, setNodeStatus, setNodeTokenInfo]);
+
+  const processGenerationQueue = useCallback(async (assistantNodeIds) => {
+    if (assistantNodeIds.length === 0) {
+      finishGeneration();
+      return;
+    }
+
+    queueGeneration(assistantNodeIds);
+    clearGlobalWarning();
+
+    for (let index = 0; index < assistantNodeIds.length; index += 1) {
+      const assistantNodeId = assistantNodeIds[index];
+      const result = await runAssistantNode(assistantNodeId);
+
+      if (result?.aborted || result?.blocked || result?.failed) {
+        const pendingIds = assistantNodeIds.slice(index + 1);
+        if (pendingIds.length > 0 && (result.aborted || result.failed)) {
+          markNodesStale(pendingIds);
+        }
+        break;
+      }
+
+      shiftGenerationQueue();
+    }
+
+    finishGeneration();
+  }, [clearGlobalWarning, finishGeneration, markNodesStale, queueGeneration, runAssistantNode, shiftGenerationQueue]);
+
+  const renderedNodes = useMemo(
+    () =>
+      nodes.map((node) => ({
+        ...node,
+        style: {
+          width: node.data.measurements?.width,
+          height: node.data.measurements?.height,
+        },
+        data: {
+          ...node.data,
+          onResize: (nodeId, params) => {
+            updateNodeMeasurements(nodeId, {
+              width: Math.round(params.width),
+              height: Math.round(params.height),
+            });
+          },
+          onCommitText: (nodeId, text) => {
+            updateNodeText(nodeId, text);
+          },
+          onUpdateConfig: (nodeId, config) => {
+            updateNodeConfig(nodeId, config);
+          },
+          onRegenerate: async (nodeId) => {
+            const queue = buildRegenerationTargets(nodeId);
+            await processGenerationQueue(queue);
+          },
+        },
+      })),
+    [buildRegenerationTargets, nodes, processGenerationQueue, updateNodeConfig, updateNodeMeasurements, updateNodeText]
   );
 
-  const handleReplicate = useCallback(async ({ props }) => {
-    const { node } = props;
-    //add a small random offset to the new node
-    const newNode = await addNode(node.type, node, { x: 200 + (Math.random()-0.5) * 100, y: (Math.random()-0.5) * 10 }, node.data.text, false);
-    
-    // Replicate upstream connections
-    edges.forEach((edge) => {
-      if (edge.target === node.id) {
-        setEdges((eds) =>
-          eds.concat({
-            id: `e${edge.source}-${newNode.id}`,
-            source: edge.source,
-            target: newNode.id,
-            data: { onEdgeClick },
-            type: 'custom',
-          })
-        );
-      }
+  const renderedEdges = useMemo(
+    () =>
+      edges.map((edge) => ({
+        ...edge,
+        data: {
+          ...edge.data,
+          onEdgeClick: deleteEdge,
+        },
+      })),
+    [deleteEdge, edges]
+  );
+
+  async function handleSendMessage() {
+    if (composerMessage.trim() === '') {
+      return;
+    }
+
+    const flow = createComposerFlow(composerMessage.trim());
+    await processGenerationQueue([flow.assistantNodeId]);
+  }
+
+  async function handleAbort() {
+    const pendingIds = generation.queue.slice(1);
+    if (pendingIds.length > 0) {
+      markNodesStale(pendingIds);
+    }
+
+    abortRef.current?.controller?.abort();
+    finishGeneration();
+  }
+
+  function handleAddSummary() {
+    const center = reactFlow.screenToFlowPosition({
+      x: window.innerWidth / 2,
+      y: window.innerHeight / 2,
     });
-  }, [addNode, edges, onEdgeClick, setEdges]);
+    createSummaryNode(center);
+  }
 
-  const handleCreateConnectedNode = useCallback(({ props }) => {
-    const { node } = props;
-    const newType = node.type === 'userInput' ? 'llmResponse' : 'userInput';
-    const nodeElement = document.querySelector(`[data-id="${node.id}"]`);
-    const nodeHeight = nodeElement ? nodeElement.offsetHeight : 0;
-    addNode(newType, node, { x: (Math.random()-0.5) * 100, y: 30 + nodeHeight }, null, true);
-  }, [addNode]);
-
-  const setSelectNode = useCallback((node) => {
-    setNodes((nds) =>
-      nds.map((n) => {
-        n.selected = n.id === node.id;
-        return n;
-      })
-    );
-  }, [setNodes]);
-
-  const getSelectedNode = useCallback(() => {
-    return nodes.find(node => node.selected);
-  }, [nodes]);
-
-  const onChunkReceived = useCallback((content) => {
-    setNodes((nds) =>
-      nds.map((n) => {
-        if (n.id === currentLlmNodeId.current) {
-          return { ...n,
-            data: { 
-            ...n.data, 
-            text: n.data.text + content 
-            }};
-        }
-        return n;
-      })
-    );
-  }, [setNodes]);
-
-  const handleSendMessage = useCallback(async () => {
-    if (message.trim() === '') return;
-
-    let selectedNode = getSelectedNode();
-    let sourceNode = selectedNode && selectedNode.type === 'llmResponse' ? selectedNode : null;
-
-    let sourceNodeElement = null;
-    if (!sourceNode) {
-      const latestLLMResponseNode = nodes.filter(node => node.type === 'llmResponse').slice(-1)[0];
-      sourceNode = latestLLMResponseNode || null;
-    } 
-    if (sourceNode) {
-      sourceNodeElement = document.querySelector(`[data-id="${sourceNode.id}"]`);
+  function handleExportMarkdown() {
+    const selectedNode = nodes.find((node) => node.selected);
+    if (!selectedNode) {
+      setGlobalWarning('Select a node before exporting Markdown.');
+      return;
     }
-    let sourceNodeHeight = sourceNodeElement ? sourceNodeElement.offsetHeight : 0;
 
-    const userNode = await addNode('userInput', sourceNode, { x: (Math.random()-0.5)*50, y: sourceNodeHeight + 20 }, message, !!sourceNode);
-    // Wait for React to update the state
-    await new Promise(resolve => setTimeout(resolve, 0));
-    const userNodeElement = document.querySelector(`[data-id="${userNode.id}"]`);
-    const userNodeHeight = userNodeElement ? userNodeElement.offsetHeight : 0;
-
-    const llmNode = await addNode('llmResponse', userNode, { x: 0, y: userNodeHeight + 20 }, '', true);
-    currentLlmNodeId.current = llmNode.id;
-    llmNode.data.text = '';
-    setMessage('');
-    setSelectNode(llmNode);
-    await new Promise(resolve => setTimeout(resolve, 0));
-    // Get the updated nodes and edges
-    const updatedNodes = reactFlow.getNodes();
-    const updatedEdges = reactFlow.getEdges();
-
-    let history = getConversationHistory(userNode, updatedNodes, updatedEdges);
-    
-    try {
-      await sendConversationRequest('generate', history, onChunkReceived);
-    } catch (error) {
-      console.error('Failed to generate response:', error);
-      // Handle error (e.g., show error message to user)
+    const markdown = buildMarkdownForNode(selectedNode.id, nodes, edges);
+    if (!markdown.trim()) {
+      setGlobalWarning('Selected node has no exportable research chain yet.');
+      return;
     }
-  }, [message, getSelectedNode, addNode, setSelectNode, reactFlow, nodes, onChunkReceived]);
+
+    downloadText(`${selectedNode.id}.md`, markdown, 'text/markdown;charset=utf-8');
+  }
+
+  function handleExportProject() {
+    exportDatabase().then((snapshot) => {
+      const payload = createProjectExportPayload(snapshot);
+      downloadText('gitchat-project.json', JSON.stringify(payload, null, 2), 'application/json;charset=utf-8');
+    });
+  }
+
+  function handleImportFile(event) {
+    const [file] = event.target.files || [];
+    if (!file) {
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      try {
+        const payload = JSON.parse(reader.result);
+        await importProject(payload);
+      } catch (error) {
+        setGlobalWarning(`Failed to import project: ${error.message}`);
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  }
+
+  async function handleSessionRename(sessionId) {
+    const session = sessions.find((item) => item.id === sessionId);
+    const nextTitle = window.prompt('Rename session', session?.title || '');
+    if (nextTitle && nextTitle.trim()) {
+      renameSession(sessionId, nextTitle.trim());
+    }
+  }
+
+  if (!isHydrated) {
+    return <div className="flex h-full items-center justify-center text-slate-600">Loading workspace…</div>;
+  }
 
   return (
-    <div className="h-full relative" ref={reactFlowWrapper}>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onMove={() => {
-          currentOverlapOffset = 0;
-        }}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
-        onNodeContextMenu={onNodeContextMenu}
-        selectionMode={SelectionMode.Partial}
-        panOnScroll
-        selectionOnDrag
-        panOnDrag={[1, 2]} // [mouse button, modifier keys]
-        fitView
-      >
-        <Controls position='top-center' orientation='horizontal'/>
-        <MiniMap position='top-right' pannable zoomable/>
-        <Background variant="dots" gap={12} size={1} />
-      </ReactFlow>
-      <div className="absolute top-4 left-4 z-20 flex space-x-2">
-        <button 
-          className="bg-green-500 text-white px-4 py-2 rounded"
-          onClick={() => {
-            addNode('userInput');
-            console.log(reactFlow.getNodes());
-          }}
-        >
-          Add User Input
-        </button>
-        <button 
-          className="bg-blue-500 text-white px-4 py-2 rounded"
-          onClick={() => {
-            addNode('llmResponse');
-          }}
-        >
-          Add LLM Response
-        </button>
-      </div>
-      <Menu id={MENU_ID}>
-        <Item onClick={handleReplicate}>Replicate Node</Item>
-        <Item onClick={handleCreateConnectedNode}>Create Connected Node</Item>
-      </Menu>
-      <div className="absolute bottom-0 left-0 right-0 p-4 bg-white border-t border-gray-200 z-50">
-        <div className="flex items-center">
-          <textarea
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            className="flex-grow mr-2 p-2 border border-gray-300 rounded"
-            placeholder="Type your message here..."
-            style={{ maxHeight: '5em', resize: 'none' }}
-          />
+    <div className="flex h-full bg-slate-100 text-slate-900">
+      <aside className="flex w-[290px] flex-col border-r border-slate-200 bg-white">
+        <div className="border-b border-slate-200 p-4">
+          <div className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500">
+            Research Sessions
+          </div>
           <button
-            onClick={handleSendMessage}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+            className="mt-3 w-full rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white"
+            onClick={() => createSession(`Research ${sessions.length + 1}`)}
           >
-            Send
+            New Session
           </button>
+        </div>
+        <div className="flex-1 space-y-2 overflow-auto p-3">
+          {sessions.map((session) => (
+            <div
+              key={session.id}
+              className={`rounded-xl border p-3 ${
+                session.id === activeSessionId ? 'border-slate-900 bg-slate-100' : 'border-slate-200 bg-white'
+              }`}
+            >
+              <button
+                className="w-full text-left text-sm font-medium"
+                onClick={() => switchSession(session.id)}
+              >
+                {session.title}
+              </button>
+              <div className="mt-2 flex gap-2 text-xs text-slate-500">
+                <button onClick={() => handleSessionRename(session.id)}>Rename</button>
+                <button onClick={() => deleteSession(session.id)}>Delete</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="space-y-2 border-t border-slate-200 p-4">
+          <button
+            className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium"
+            onClick={handleAddSummary}
+          >
+            Add Summary Note
+          </button>
+          <button
+            className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium"
+            onClick={handleExportMarkdown}
+          >
+            Export Selected Chain
+          </button>
+          <button
+            className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium"
+            onClick={handleExportProject}
+          >
+            Export Project JSON
+          </button>
+          <button
+            className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Import Project JSON
+          </button>
+          <input
+            ref={fileInputRef}
+            hidden
+            type="file"
+            accept="application/json"
+            onChange={handleImportFile}
+          />
+        </div>
+      </aside>
+
+      <div className="relative flex-1">
+        <ReactFlow
+          nodes={renderedNodes}
+          edges={renderedEdges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          selectionMode={SelectionMode.Partial}
+          panOnScroll
+          selectionOnDrag
+          panOnDrag={[1, 2]}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={(connection) => {
+            const success = connectNodes(connection);
+            if (!success) {
+              setGlobalWarning('Invalid connection. Summary nodes cannot join the DAG, and cycles are blocked.');
+            }
+          }}
+          onNodeClick={(_, node) => selectNode(node.id)}
+          onPaneClick={() => clearGlobalWarning()}
+          onMove={(_, viewport) => setViewport(viewport)}
+          fitView
+        >
+          <Controls position="top-center" orientation="horizontal" />
+          <MiniMap position="top-right" pannable zoomable />
+          <Background variant="dots" gap={16} size={1} />
+        </ReactFlow>
+
+        <div className="absolute left-6 top-6 z-20 flex max-w-xl flex-col gap-3">
+          {ui.globalWarning && (
+            <div className="rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 shadow-sm">
+              {ui.globalWarning}
+            </div>
+          )}
+          {generation.isGenerating && (
+            <div className="flex items-center gap-3 rounded-2xl border border-sky-200 bg-white px-4 py-3 shadow-sm">
+              <div className="text-sm text-slate-700">Running {generation.queue.length} queued generations…</div>
+              <button
+                className="rounded-full bg-rose-600 px-3 py-1 text-xs font-medium text-white"
+                onClick={handleAbort}
+              >
+                Stop
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="absolute bottom-0 left-0 right-0 z-30 border-t border-slate-200 bg-white/95 p-4 backdrop-blur">
+          <div className="mx-auto flex max-w-5xl items-end gap-3">
+            <textarea
+              value={composerMessage}
+              onChange={(event) => setComposerMessage(event.target.value)}
+              className="min-h-[88px] flex-1 rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm outline-none"
+              placeholder="Draft a new root question or branch from the selected assistant node."
+            />
+            <button
+              className="rounded-2xl bg-slate-900 px-5 py-3 text-sm font-medium text-white"
+              onClick={handleSendMessage}
+            >
+              Send
+            </button>
+          </div>
         </div>
       </div>
     </div>

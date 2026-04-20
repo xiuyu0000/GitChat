@@ -41,7 +41,7 @@ const CustomEdge = ({
           cursor: 'pointer',
         }}
         d={edgePath[0]}
-        onClick={() => data.onEdgeClick(id)}
+        onClick={() => data?.onEdgeClick?.(id)}
       />
     </>
   );

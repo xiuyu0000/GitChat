@@ -2,6 +2,17 @@
 @import 'tailwindcss/components';
 @import 'tailwindcss/utilities';
 
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: 'SF Pro Text', 'Segoe UI', sans-serif;
+}
+
 .markdown > * {
-    all: revert;
-  }
+  all: revert;
+}

@@ -1,138 +1,108 @@
-import React, { memo, useRef, useEffect, useState, useCallback } from 'react';
-import { Handle, Position, useReactFlow } from '@xyflow/react';
+import React, { memo, useEffect, useMemo, useState } from 'react';
+import { Handle, NodeResizer, Position } from '@xyflow/react';
 import ReactMarkdown from 'react-markdown';
-import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
-import { okaidia } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import remarkGfm from 'remark-gfm';
 
-const LLMResponseNode = (props) => {
-  const [isEditing, setIsEditing] = useState(false);
-  const [text, setText] = useState(props.data.text);
-  const [isFolded, setIsFolded] = useState(true);
-  const [isFoldable, setIsFoldable] = useState(false);
-  const { setNodes } = useReactFlow();
-  const textareaRef = useRef(null);
-  const contentRef = useRef(null);
+function LLMResponseNode({ id, data, selected }) {
+  const [text, setText] = useState(data.text || '');
+  const toolPayload = useMemo(() => data.toolPayload || [], [data.toolPayload]);
 
   useEffect(() => {
-    if (props.data.text !== text) {
-      setText(props.data.text);
-    }
-  }, [props.data.text]);
-
-  useEffect(() => {
-    if (contentRef.current) {
-      setIsFoldable(contentRef.current.scrollHeight > 160); // Set the foldable height limit (e.g., 160px)
-    }
-  }, [text, isEditing]);
-
-  const onTextChange = useCallback((evt) => {
-    setText(evt.target.value);
-  }, []);
-
-  const onTextBlur = useCallback(() => {
-    setIsEditing(false);
-    setNodes((nodes) =>
-      nodes.map((node) => {
-        if (node.id === props.id) {
-          node.data = { ...node.data, text };
-        }
-        return node;
-      })
-    );
-  }, [props, setNodes, text]);
-
-  const handleDoubleClick = useCallback(() => {
-    if (contentRef.current) {
-        const divWidth = contentRef.current.offsetWidth;
-        setIsEditing(true);
-        setTimeout(() => {
-          if (textareaRef.current) {
-            textareaRef.current.style.width = `${divWidth}px`;
-            textareaRef.current.style.height = 'auto';
-            textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
-          }
-        }, 0);
-      }
-  }, []);
-
-  const toggleFold = () => {
-    setIsFolded(!isFolded);
-  };
+    setText(data.text || '');
+  }, [data.text]);
 
   return (
     <div
-      className={`px-4 py-2 shadow-md rounded-md bg-blue-100 border-2 ${
-        props.selected ? 'border-blue-500' : 'border-blue-200'
-      } relative`}
-      style={{ 
-        maxWidth: isFolded ? '25em' : '35em',
-     }}
+      className={`relative rounded-2xl border-2 bg-sky-50 shadow-lg ${
+        data.metadata?.isStale
+          ? 'border-rose-400'
+          : selected
+            ? 'border-sky-500'
+            : 'border-sky-200'
+      }`}
+      style={{
+        width: data.measurements?.width,
+        height: data.measurements?.height,
+      }}
     >
-      <Handle type="target" position={Position.Top} className="!w-3 !h-3 !bg-blue-500" />
-      <div className="font-bold text-sm text-blue-700 flex justify-between">
-        LLM Response
-        {isFoldable && (
-          <button onClick={toggleFold} className="text-xs text-blue-500">
-            {isFolded ? 'Expand' : 'Fold'}
-          </button>
-        )}
-      </div>
-      {isEditing ? (
-        <textarea
-          ref={textareaRef}
-          className="w-full p-2 text-gray-700 border rounded min-h-[50px] nodrag nopan nowheel resize" 
-          value={text}
-          style={{ 
-            minWidth: '10em',
-            maxHeight: isFolded ? '10em' : '30em',
-            width: 'auto',
-        }}
-          onChange={onTextChange}
-          onBlur={onTextBlur}
-          autoFocus
-        />
-      ) : (
-        <div
-          ref={contentRef}
-          className={`text-gray-700 cursor-text nopan nodrag ${isFolded ? 'nowheel' : ''}`}
-          style={{
-            userSelect: 'text',
-            maxHeight: isFolded ? '10em' : 'none',
-            overflow: isFolded ? 'auto' : 'visible'
-          }}
-          onDoubleClick={handleDoubleClick}
-        >
-          <ReactMarkdown
-            className="markdown"
-            remarkPlugins={[remarkGfm]}
-            components={{
-              code({ node, inline, className, children, ...props }) {
-                const match = /language-(\w+)/.exec(className || '');
-                return !inline && match ? (
-                  <SyntaxHighlighter
-                    style={okaidia}
-                    language={match[1]}
-                    PreTag="div"
-                    {...props}
-                  >
-                    {String(children).replace(/\n$/, '')}
-                  </SyntaxHighlighter>
-                ) : (
-                  <code className={className} {...props}>
-                    {children}
-                  </code>
-                );
-              }
-            }}
-          >
-            {text}
-          </ReactMarkdown>
+      <NodeResizer
+        isVisible={selected}
+        minWidth={280}
+        minHeight={200}
+        lineClassName="!border-sky-400"
+        handleClassName="!bg-sky-500 !border-0"
+        onResizeEnd={(_, params) => data.onResize(id, params)}
+      />
+      <Handle
+        type="target"
+        position={Position.Top}
+        className="!h-3 !w-3 !bg-sky-500"
+      />
+      <Handle
+        type="source"
+        position={Position.Bottom}
+        className="!h-3 !w-3 !bg-sky-500"
+      />
+      <div className="flex h-full flex-col p-4">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="text-left">
+            <div className="text-xs font-semibold uppercase tracking-wide text-sky-700">
+              Generative Node
+            </div>
+            <div className="text-[11px] text-sky-600">
+              {data.status === 'generating' ? 'Streaming response…' : data.status}
+            </div>
+          </div>
+          <div className="flex gap-2">
+            {data.metadata?.isStale && (
+              <span className="rounded-full bg-rose-100 px-2 py-1 text-[11px] font-medium text-rose-700">
+                Stale
+              </span>
+            )}
+            {data.metadata?.accumulatedTokens ? (
+              <span className="rounded-full bg-sky-200 px-2 py-1 text-[11px] font-medium text-sky-700">
+                ~{data.metadata.accumulatedTokens} tok
+              </span>
+            ) : null}
+          </div>
         </div>
-      )}
-      <Handle type="source" position={Position.Bottom} className="!w-3 !h-3 !bg-blue-500" />
+
+        {toolPayload.length > 0 && (
+          <div className="mb-3 space-y-2">
+            {toolPayload.map((item) => (
+              <details key={item.id} className="rounded-xl border border-sky-200 bg-white/75 p-2">
+                <summary className="cursor-pointer text-left text-xs font-semibold uppercase tracking-wide text-sky-700">
+                  {item.title}
+                </summary>
+                <pre className="mt-2 whitespace-pre-wrap text-left text-xs text-slate-700">
+                  {item.content}
+                </pre>
+              </details>
+            ))}
+          </div>
+        )}
+
+        {data.metadata?.errorMessage && (
+          <div className="mb-3 rounded-xl border border-rose-300 bg-rose-50 px-3 py-2 text-left text-xs text-rose-800">
+            {data.metadata.errorMessage}
+          </div>
+        )}
+
+        <div className="h-full overflow-auto rounded-xl border border-sky-200 bg-white/80 p-3 text-left">
+          <textarea
+            className="mb-3 h-24 w-full resize-none rounded-lg border border-sky-100 bg-sky-50/60 p-2 text-sm text-slate-800 outline-none"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            onBlur={() => data.onCommitText(id, text)}
+            placeholder="LLM output will stream here."
+          />
+          <div className="markdown text-sm text-slate-800">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          </div>
+        </div>
+      </div>
     </div>
   );
-};
+}
 
 export default memo(LLMResponseNode);
